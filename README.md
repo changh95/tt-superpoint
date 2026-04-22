@@ -21,13 +21,22 @@ SP_N_ITER=100 \
 bash run_benchmark.sh
 ```
 
-The benchmark reports three fps numbers plus accuracy:
+## Sample output
 
-| Metric | Meaning |
-|---|---|
-| `inference_speed` | Traced device forward pass only. Apples-to-apples with the paper's 11.15 ms figure. |
-| `inference_speed_match_paper` | Trace + D2H + descriptor sampling at 1000 keypoints. Matches the paper's "13 ms / 70 fps" definition. |
-| `inference_speed_e2e` | Full pipeline including single-pass NMS + keypoint extraction + grid-sample. |
+Top-500 tt-nn keypoints overlaid on the resized (480×640) sample image.
+Circle radius is proportional to keypoint score.
+
+![tt-nn SuperPoint keypoints on the sample image](media/sample.png)
+
+Reproduce with:
+
+```bash
+TT_METAL_DIR=/absolute/path/to/tt-metal \
+DEVICE_ID=0 \
+PYTHONPATH=.:$TT_METAL_DIR:$TT_METAL_DIR/ttnn \
+TT_METAL_HOME=$TT_METAL_DIR ARCH_NAME=blackhole \
+python models/visualize.py
+```
 
 ## Final results (Blackhole p150b, 480×640, batch 1, natural image)
 
@@ -149,7 +158,10 @@ tt-superpoint/
 ├── results.tsv                   # Full experiment log
 ├── sample_data/
 │   └── house_in_field_1080p.jpg  # Natural-image validation input
+├── media/
+│   └── sample.png                # Rendered keypoint visualisation
 └── models/
+    ├── visualize.py                 # Keypoint visualisation script
     ├── reference/
     │   └── superpoint_reference.py  # HF reference model loader + input helpers
     ├── tests/
@@ -158,10 +170,3 @@ tt-superpoint/
         └── superpoint_ttnn.py       # tt-nn implementation
 ```
 
-## Bill of constraints
-
-- Precision floor: ≥ 99% of torch reference on dense score and descriptor
-  maps (held at 0.9971 / 0.9991).
-- Single p150a/p150b chip — no multi-device.
-- Fixed input resolution 480×640, batch 1 — matches the paper.
-- Pre-trained weights from `magic-leap-community/superpoint`, never retrained.

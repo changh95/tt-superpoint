@@ -1,0 +1,24 @@
+commit	gen_speed	accuracy	status	description
+6f3e16b	5.85	69.82	keep	initial port: on-device encoder+heads (LoFi bfloat8_b), host softmax+norm+nms; score PCC 0.698 (pre-NMS), desc PCC 0.979
+-	0.00	0.0	crash	device 3 ARC core (8,0) wedged — tt-smi -r 3 re-init fails persistently; luwen reset also fails; requires hardware power-cycle or admin intervention
+b0ecf6a	6.41	99.72	keep	encoder+heads precision to HiFi2/bfloat16-weights/fp32-acc — +9.6% speed AND pre-NMS PCC 0.997 score / 0.999 desc (meets 99% target)
+1448e41	6.46	90.99	discard	encoder weights → bfloat8_b (+fp32 acc HiFi2) — score PCC 0.91 < 99%, reverted
+0293b09	6.40	99.72	keep	reduce DRAM slice counts (8,4,2,1)→(4,2,1,1) — speed parity, simpler config
+a828c8a0fc	6.36	99.72	discard	deallocate_activation=True on convs — marginal regression, no benefit at this model size
+1c2a582945	6.59	99.72	keep	move descriptor L2-normalize to device — +2.9% speed, PCC unchanged
+e37ebc7bfa	0.00	0.00	crash	DRAM slices (2,1,1,1) — block0/1 exceeds L1 (1.58MB>1.57MB limit)
+7ce44b087a	6.26	99.72	discard	slices (4,1,1,1) — block 1 L1-full slower than 2-slice DRAM
+f7bbfbe61b	6.22	99.72	discard	enable conv weights double-buffering — slower (tighter CBs at block 0)
+5a705bdb6c	71.31	99.72	keep	ttnn.trace for device forward — 10.8x speedup (Python dispatch was 97% of wall)
+293c0c3564	0.00	0.00	crash	slices (2,2,1,1) — block 0 conv_b L1 CB overflow 1.58MB>1.57MB
+34263c73b0	70.81	91.49	discard	encoder math LoFi — PCC 0.91 (below 99%); LoFi loses precision even w/ bf16 weights+fp32 acc
+787eff6ac6	72.04	99.72	keep	2 command queues — H2D on CQ1 overlaps trace on CQ0 (+1%)
+36a30ed431	71.41	99.72	discard	act_block_h_override=32 on block 0 — no improvement
+0ed74e2c38	71.90	90.89	discard	bf8 weights on encoder block 0 only — score PCC 0.91 < 99%
+33c0baa74b	71.78	99.72	discard	enable_act_double_buffer=True — noise (-0.4%)
+054919427c	72.08	99.72	discard	reallocate_halo_output=True — noise (no effect)
+065edd0c56	71.53	99.72	discard	BLOCK_SHARDED on encoder block 3 — no benefit at this size
+67009b0cdb	71.62	99.72	discard	full_inner_dim=True — noise, no effect
+e5e5b7147b	73.65	99.72	keep	final stable benchmark (SP_N_ITER=100) — 12.6x speedup from initial port
+49b0c9e2b6	73.71	99.74	keep	(natural, 100-iter) fps_traced=73.71, fps_e2e=16.71, keypoint F1=98.8% at tol=2px/k=500
+7d1c3785c0	73.60	99.71	keep	(natural, 100-iter) fps_traced=73.60, fps_match_paper=41.55, fps_e2e=17.03; device softmax, keypoint F1=98.8%

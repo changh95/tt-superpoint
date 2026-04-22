@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+generated/
+*.log
+run.log
+.venv/
+.vscode/
+.idea/
+.omc/

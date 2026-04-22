@@ -133,6 +133,7 @@ here are short hashes from the branch the work was developed on.
 | `deallocate_activation=True` on convs | marginal regression |
 | `WIDTH_SHARDED` on block 0 | OOM — 1-channel input can't distribute across banks |
 | Device NMS via standalone trace | per-op Python dispatch ate the savings (+6% for +code) |
+| **Device fold+NMS inside main trace** (`36dc956`, opt-in via `SP_TRACE_NMS=1`) | ~6 ms 5D-permute + DRAM-reshape chain overhead cancels the 36 ms host-NMS saving; `fps_compute_only` drops 353 → 108. Kept as an opt-in implementation showing the Python-composed approach; a fused C++ kernel would flip this. |
 
 ### What each run taught
 
@@ -152,17 +153,29 @@ here are short hashes from the branch the work was developed on.
 
 ### Attempted but not completed
 
-- **Full fold + NMS inside the traced forward.** Reshaping the
-  `(1, 1, 4800, 64)` intermediate through `(1, enc_h, enc_w, 8, 8)` and
-  a 5-D permute into `(1, 480, 640, 1)` triggered
-  `Shard page size must currently have L1 aligned page size` errors from
-  ttnn's internal `interleaved_to_sharded` step on the reshape output.
-  Resolving it would likely require a custom C++ kernel that avoids the
-  sharded intermediate.
+- **Full fold + NMS inside the traced forward.** Now works (commit
+  `36dc956`, opt-in via `SP_TRACE_NMS=1`). The page-alignment error was
+  fixed by pinning every reshape to `DRAM_MEMORY_CONFIG` and materialising
+  the zero-padding tensor once (trace capture rejects in-trace `ttnn.zeros`
+  writes). Functionally correct — accuracy identical to host NMS — but
+  the Python-composed fold overhead (~6 ms for the 5D-permute + reshape
+  chain) negates the saved host NMS time. A fused C++ kernel would
+  eliminate this overhead.
+- **Device-side `grid_sample`.** `ttnn.grid_sample` exists and is
+  verified working. On a natural image with ~500 keypoints, the host
+  `F.grid_sample` costs ~1.15 ms — not a meaningful target against the
+  ~36 ms host NMS wall, so not integrated. Worth doing when post-proc
+  stops being NMS-dominated.
 - **Custom fused C++ Tensix kernel (conv + pool, or fold + max-pool).**
   Each experimental fused op in `tt-metal` is roughly 700–1000 LoC across
   reader/writer/compute kernels, program factory, and nanobind
-  registration. Out of session scope.
+  registration. Out of session scope. This is the only remaining path to
+  push `fps_compute_only` above 353 fps or to make the device fold+NMS
+  actually pay off.
+- **Reducing `ttnn.copy_host_to_device_tensor`'s ~10.7 ms-per-call
+  dispatch floor.** Runtime-level work; not addressable from the model
+  layer. Would take `inference_speed` (forward + per-frame H2D) from
+  ~72 fps toward the 353 fps compute ceiling.
 
 ## Layout
 

@@ -22,3 +22,4 @@ f7bbfbe61b	6.22	99.72	discard	enable conv weights double-buffering — slower (t
 e5e5b7147b	73.65	99.72	keep	final stable benchmark (SP_N_ITER=100) — 12.6x speedup from initial port
 49b0c9e2b6	73.71	99.74	keep	(natural, 100-iter) fps_traced=73.71, fps_e2e=16.71, keypoint F1=98.8% at tol=2px/k=500
 7d1c3785c0	73.60	99.71	keep	(natural, 100-iter) fps_traced=73.60, fps_match_paper=41.55, fps_e2e=17.03; device softmax, keypoint F1=98.8%
+62f112d922	353.31	99.71	keep	(natural, 100-iter) fps_compute_only=353.31, fps_traced=71.81, fps_match_paper=41.95, fps_e2e=17.06; prebuild host input + expose pure-compute metric

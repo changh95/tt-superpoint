@@ -166,12 +166,18 @@ here are short hashes from the branch the work was developed on.
   `F.grid_sample` costs ~1.15 ms — not a meaningful target against the
   ~36 ms host NMS wall, so not integrated. Worth doing when post-proc
   stops being NMS-dominated.
-- **Custom fused C++ Tensix kernel (conv + pool, or fold + max-pool).**
-  Each experimental fused op in `tt-metal` is roughly 700–1000 LoC across
-  reader/writer/compute kernels, program factory, and nanobind
-  registration. Out of session scope. This is the only remaining path to
-  push `fps_compute_only` above 353 fps or to make the device fold+NMS
-  actually pay off.
+- **Custom fused C++ Tensix kernel `ttnn.experimental.sp_eq_mul_mask`** —
+  **LANDED** (see `kernels/sp_eq_mul_mask/`). Fuses `eq + multiply` into a
+  single JIT-compiled Tensix program that keeps the mask tile in a DST
+  register between the SFPU `eq_binary_tile` and `mul_binary_tile` calls —
+  no DRAM round-trip for the intermediate. ~450 LoC of C++.
+  - **Accuracy**: byte-identical to torch reference across match rates
+    0 → 100% (max abs diff = 0.0, exact nonzero count).
+  - **Throughput**: 0.184 ms/iter fused vs 0.276 ms/iter composed
+    (`ttnn.eq` + `ttnn.multiply`) — **1.50×** on a 1×1×307 200×32 bf16 pair.
+  - Closes one of the two remaining ops in the device-NMS chain (the
+    other — a fold + max_pool + compare — would be a similar-sized custom
+    op on top of this template).
 - **Reducing `ttnn.copy_host_to_device_tensor`'s ~10.7 ms-per-call
   dispatch floor.** Runtime-level work; not addressable from the model
   layer. Would take `inference_speed` (forward + per-frame H2D) from
@@ -188,6 +194,13 @@ tt-superpoint/
 │   └── house_in_field_1080p.jpg  # Natural-image validation input
 ├── media/
 │   └── sample.png                # Rendered keypoint visualisation
+├── kernels/
+│   └── sp_eq_mul_mask/              # Fused C++ Tensix kernel (eq + mul in one pass)
+│       ├── README.md                # Install + measurements
+│       ├── test.py                  # Correctness vs torch reference
+│       ├── bench.py                 # Fused vs composed throughput
+│       ├── {hpp,cpp,nanobind}       # Public API + Python binding
+│       └── device/                  # Device op + program factory + 3 kernels
 └── models/
     ├── visualize.py                 # Keypoint visualisation script
     ├── reference/

@@ -24,8 +24,8 @@ bash run_benchmark.sh
 
 `SP_TRACE_NMS=1` closes the NMS loop on device via the fused
 `ttnn.experimental.sp_eq_mul_mask` kernel — that's the fast e2e path
-(24 fps on a natural image vs 17 fps with host NMS).  Omit the flag to
-run the pure-forward trace with host NMS.
+(**40.7 fps** on a natural image vs 17 fps with host NMS).  Omit the flag
+to run the pure-forward trace with host NMS.
 
 ## Sample output
 
@@ -87,18 +87,19 @@ Two traced inference paths are available; pick via the `SP_TRACE_NMS` env var.
 
 | Metric | Random input | Natural image | Paper (Titan X, 2018 Caffe) |
 |---|---:|---:|---:|
-| Device forward + device NMS (pre-resident) | 85.60 fps | 85.59 fps (11.7 ms) | 90 fps (11.15 ms) |
-| Traced forward+NMS incl. per-frame H2D | 44.54 fps | 44.53 fps | — |
-| `fps_match_paper` (forward + descriptor sampling) | 27.53 fps | 30.01 fps | 70 fps (13 ms) |
-| **Full e2e (no host NMS)** | **27.37 fps** | **24.11 fps** | not reported |
+| Device forward + device NMS (pre-resident) | 85.59 fps | 85.60 fps (11.68 ms) | 90 fps (11.15 ms) |
+| Traced forward+NMS incl. per-frame H2D | 44.55 fps | 44.56 fps | — |
+| `fps_match_paper` (forward + descriptor sampling) | 28.46 fps | 29.18 fps | 70 fps (13 ms) |
+| **Full e2e (no host NMS)** | **40.69 fps** | **40.73 fps** | not reported |
 
 **E2E win**: moving NMS on-device via the fused `sp_eq_mul_mask` C++ kernel
-pushes end-to-end throughput from **17.0 → 24.1 fps** on the natural image
-(**+41%**) and **17.5 → 27.4 fps** on random (**+56%**). PCC and F1 are
-preserved to the last digit (0.9971 / 98.80% on natural).
+plus a stack of dispatch/host-side cleanups pushes end-to-end throughput from
+**17.0 → 40.73 fps** on the natural image (**+140%**) and
+**17.5 → 40.69 fps** on random (**+132%**). PCC and F1 are preserved to the
+last digit (0.9971 / 98.80% on natural).
 
 The device-NMS trace absorbs the 36 ms host simple_nms into ~7 ms of extra
-device-side work (8-op fold + `max_pool2d` + `sp_eq_mul_mask` + row-major
+device-side work (fold + `max_pool2d` + `sp_eq_mul_mask` + row-major
 channel-0 slice) — that's why `compute_only` and `match_paper` look lower in
 the second table: the traced region now does strictly more work. Pure forward
 fps is unchanged.
@@ -107,14 +108,15 @@ E2E per-phase breakdown (SP_TRACE_NMS=1, natural image, ms/iter):
 
 | Phase | ms |
 |---|---:|
-| H2D + traced forward+NMS (dual-CQ pipelined) | 22.5 |
-| D2H (descriptor + single-channel NMS map) | 13.9 |
-| Host post (keypoint extraction + grid_sample) | 5.3 |
+| Compute-phase (Python dispatch + event records; trace runs async) | 8.4 |
+| D2H (descriptor tile + single-channel NMS map, 2× `ttnn.to_torch`) | 14.3 |
+| Host post (keypoint extraction + grid_sample) | 1.8 |
 
-D2H is dominated by ttnn's per-call `from_device` dispatch cost (~9 ms per
+D2H is dominated by ttnn's per-call `from_device` dispatch cost (~6–9 ms per
 call even on a 614 KB tensor); it's the same runtime floor that caps H2D at
-~10.7 ms. Future throughput gains need either a batched D2H API or a further
-kernel fusion that pushes host post onto the chip.
+~10.7 ms. Input double-buffering to hide H2D behind trace was tried twice
+and regressed (see the Reverts table) — the fix would need a 1-channel NMS
+kernel to cut layout conversions out of the trace, or a batched D2H API.
 
 Measurement methodology: 10-iteration inner loop per metric, SP_N_ITER=100 for
 stable numbers. Compute-only uses `blocking=False` + a single final sync;
@@ -159,6 +161,10 @@ here are short hashes from the branch the work was developed on.
 | 7 | Device softmax (verified `ttnn.softmax` respects 65-dim logical shape) (`7d1c378`) | 73.60 | accuracy-neutral; unblocks future on-device post-proc |
 | 8 | **SRAM diagnostic + prebuild host bf16 input once** (`62f112d`) | 73.60 → **353.31** (compute-only) | Isolated ttnn's per-call Python H2D dispatch cost (~10.7 ms/call, payload-independent) from actual device compute (2.83 ms/iter) — hardware forward-pass fps is **3.9×** the paper on natural image |
 | 9 | **Fused `sp_eq_mul_mask` closes NMS loop on device** | (e2e: 17.00 → **24.11 fps**) | Replaces the 36 ms host simple_nms with `ttnn.max_pool2d` + the fused C++ kernel (`ttnn.experimental.sp_eq_mul_mask`) + an on-device channel-0 slice. 7 ms of extra trace work saves 36 ms of host work. F1 unchanged at 98.80%; PCC unchanged at 0.9971. |
+| 10 | **Drop redundant `synchronize_device` before D2H** | (e2e: 24.11 → **34.28 fps**, +40%) | The explicit full-device sync before the D2H phase was forcing CQ1's pipelined H2D to drain at the same time as CQ0's trace; the first `ttnn.to_torch` on CQ0 already blocks implicitly on trace completion, so the sync was pure serialization. One-line removal. |
+| 11 | Drop redundant `.contiguous()` before `.float()` on descriptor | (e2e: 34.28 → 38.11 fps, +6%) | `.float()` on a non-contiguous bf16 tensor already allocates a contiguous fp32 copy; the intermediate `.contiguous()` was doing a second 1.2 MB bf16→bf16 copy. Host post phase 4.5 → 2.3 ms. |
+| 12 | Skip `.float()` on `nms_scores`, keep bf16 | (e2e: 38.11 → 39.87 fps, +4.6%) | `torch.nonzero`, `torch.topk` and indexing all support bf16; only the keypoint coords need an fp32 cast at `grid_sample` call-site (`kp.float()[None]`). Saves a ~1 ms 614 KB bf16→fp32 host copy per iter. |
+| 13 | Consolidate intermediate reshapes in `_device_fold_and_nms` | (e2e: 39.87 → **40.73 fps**, +2.2%) | Two intermediate reshape views — `(b,enc_h,enc_w,64)` and `(b,H,W,1)` — were unnecessary. Reshape directly from row-major `(b,1,enc_h·enc_w,64)` to 5D `(b,enc_h,enc_w,8,8)` pre-permute, and from the permuted tensor to flat `(1,1,b·H·W,1)` post-permute. |
 
 ### Reverts (PCC fell below 99% or no wall-clock gain)
 
@@ -179,6 +185,12 @@ here are short hashes from the branch the work was developed on.
 | `WIDTH_SHARDED` on block 0 | OOM — 1-channel input can't distribute across banks |
 | Device NMS via standalone trace | per-op Python dispatch ate the savings (+6% for +code) |
 | Device fold+NMS Python-composed (pre-fused-kernel) (`36dc956`) | Used to be net-negative: 6 ms fold + host compare/mask cancelled the 36 ms host-NMS saving. **Superseded**: once `sp_eq_mul_mask` closes the compare+mask on device, the same fold chain becomes net-positive (+41% e2e, now the default via `SP_TRACE_NMS=1`). |
+| Pack descriptor + NMS into one tensor for a single D2H | Tile→row-major layout conversion on 1.2 MB descriptor + `ttnn.concat` added ~7 ms of trace work AND blew up D2H to 53.5 ms (likely the combined tensor broke amortization of trace-tail wait). e2e 34.28 → 14.07 — biggest regression of the whole project. |
+| `ThreadPoolExecutor` for host post-processing | Post is only 2–4 ms; the worker-thread submit/result barrier added ~0.6 ms and GIL contention with `ttnn.to_torch` pushed D2H up. Net flat within noise. |
+| Both D2Hs as `from_device(blocking=False)` + `synchronize_device` | CQ0 dispatch serializes internally regardless; flat (35.89 vs 35.94 baseline). |
+| Cast descriptor to `bfloat8_b` before D2H | Halves the device payload (1.2 MB → 614 KB) but the host-side bf8→fp32 unpack path was *slower* than bf16→fp32 — D2H grew 14.3 → 17.2 ms. Descriptor PCC held at 0.9991 so quality was fine; purely a ttnn host-unpack cost issue. |
+| Skip `to_memory_config(DRAM)` before `to_layout(TILE)` on `s_pooled` | CRASH: `ttnn.max_pool2d`'s sharded output has shard shape (2793, 32) which isn't tile-aligned; `to_layout(TILE)` rejects sharded input unless shards are tile-aligned. Must interleave to DRAM first. |
+| Input double-buffering (two `tt_in` buffers, two captured traces, alternating) | Tried twice — once with D2H split across CQs and once with D2H unchanged — BOTH regressed e2e to ~36 fps. Host post phase consistently jumped 1.8 → 4.4–4.7 ms even with identical post code; suspected DRAM contention between concurrent CQ1 H2D and CQ0 trace, or event-scheduling overhead with two tids. Requires tracy profiling to diagnose; not worth pursuing without profiler data. |
 
 ### What each run taught
 
@@ -210,9 +222,30 @@ here are short hashes from the branch the work was developed on.
   natural image.
 - **Device-side `grid_sample`.** `ttnn.grid_sample` exists and is
   verified working. On a natural image with ~500 keypoints, the host
-  `F.grid_sample` costs ~1.15 ms — still not a meaningful target against
+  `F.grid_sample` costs ~1.15 ms — not a meaningful target against
   the 9–14 ms D2H dispatch floor. Worth doing when D2H stops being
   dispatch-dominated.
+- **Input double-buffering to pipeline H2D with trace.** Two tt_in
+  buffers, two captured traces, alternating per-iter so CQ1's H2D
+  writes a *different* buffer than CQ0's current trace reads. Analysis
+  suggested a ~25% ceiling uplift if D2H could also split across CQs.
+  **Attempted and reverted twice** — both variants (D2H-split and
+  D2H-unchanged) regressed the host post phase from 1.8 to ~4.5 ms,
+  wiping out the expected device-side gains. The regression is
+  reproducible but unexplained from Python alone; the most likely
+  suspects are DRAM/NoC contention between the concurrent CQ1 H2D and
+  CQ0 trace, or ttnn event-scheduling overhead when two tids alternate.
+  Needs tracy profiling before re-attempting. Documented in `results.tsv`
+  under commits `2f00f2b1` and `6d4fae39`.
+- **1-channel NMS kernel (C++).** The current NMS chain pads
+  `s_flat` from 1 channel to 32 (via `ttnn.concat` with a persistent
+  zero-pad tensor) so that `ttnn.max_pool2d` and `sp_eq_mul_mask` — both
+  of which require tile-aligned channel dims (multiples of 32) — can
+  run. The 31 zero channels contribute nothing semantically. A custom
+  1-channel `max_pool2d`-style Tensix kernel would eliminate the
+  concat, one layout conversion, and the 32→1 slice at the end,
+  cutting ~3 ms from the trace interior. Similar scope to the landed
+  `sp_eq_mul_mask` kernel (~450 LoC).
 - **Custom fused C++ Tensix kernel `ttnn.experimental.sp_eq_mul_mask`** —
   **LANDED and on the critical path** (see `kernels/sp_eq_mul_mask/`).
   Fuses `eq + multiply` into a single JIT-compiled Tensix program that

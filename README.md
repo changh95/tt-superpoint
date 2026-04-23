@@ -68,10 +68,16 @@ accuracy claim.
 
 | Metric | Random input | Natural image | Paper (Titan X, 2018 Caffe) |
 |---|---:|---:|---:|
-| **Device forward (input pre-resident)** | **353.9 fps** | **353.3 fps (2.83 ms)** | 90 fps (11.15 ms) |
-| Traced forward incl. per-frame H2D | 72.29 fps | 71.81 fps | — |
-| `fps_match_paper` (forward + descriptor sampling) | 41.63 fps | 41.95 fps | 70 fps (13 ms) |
-| Full e2e (incl. host NMS) | 17.58 fps | 17.06 fps | not reported |
+| **Device forward (input pre-resident)** | **355.26 fps** | **355.39 fps (2.81 ms)** | 90 fps (11.15 ms) |
+| Traced forward incl. per-frame H2D | 73.58 fps | 73.63 fps | — |
+| `fps_match_paper` (forward + descriptor sampling) | 41.95 fps | 41.62 fps | 70 fps (13 ms) |
+| Full e2e (incl. host NMS) | 17.50 fps | 17.00 fps | not reported |
+
+Numbers above were re-measured against the freshly-built tt-metal stack that
+includes the `sp_eq_mul_mask` fused kernel (see `kernels/`). The default
+inference path doesn't depend on it, so numbers track the prior reading
+within noise — confirming the custom C++ op lands cleanly without disturbing
+the measured pipeline.
 
 Measurement methodology: 10-iteration inner loop per metric, SP_N_ITER=100 for
 stable numbers. Compute-only uses `blocking=False` + a single final sync;

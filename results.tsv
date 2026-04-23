@@ -25,3 +25,4 @@ e5e5b7147b	73.65	99.72	keep	final stable benchmark (SP_N_ITER=100) — 12.6x spe
 62f112d922	353.31	99.71	keep	(natural, 100-iter) fps_compute_only=353.31, fps_traced=71.81, fps_match_paper=41.95, fps_e2e=17.06; prebuild host input + expose pure-compute metric
 36dc9565a3	353.69	99.71	keep	(natural, 100-iter) SP_TRACE_NMS=0 default path; SP_TRACE_NMS=1 device-fold+NMS opt-in code added but net-negative (compute 108 fps vs 353 default) due to 5D permute/DRAM-reshape overhead cancelling host-NMS savings
 8c8b473	—	100.00	keep	fused C++ Tensix kernel ttnn.experimental.sp_eq_mul_mask — 1.50x vs ttnn.eq+mul composed (0.184ms vs 0.276ms/iter on 1x1x307200x32 bf16); byte-identical to torch ref across match rates 0..100%
+da62f38	355.39	99.71	keep	re-measured on fresh tt-metal build (w/ sp_eq_mul_mask kernel registered): fps_compute_only=355.39, fps_traced=73.63, fps_match_paper=41.62, fps_e2e=17.00 (natural); sample.png regenerated

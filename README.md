@@ -6,26 +6,78 @@ SuperPoint keypoint-detection inference on a single Tenstorrent Blackhole
 Reference: `magic-leap-community/superpoint` on Hugging Face.
 Input: single-image, 480×640, batch size 1.
 
+Since 2026-09-13 the default device path is **fused**: one metal trace per frame with a
+standard-op device NMS — served end-to-end 56.8 → 23.8 ms median on a p150a, same keypoints
+and scores as before. `TT_FUSED=0` restores the previous path bit for bit.
+
+## Two device paths
+
+| Path | Knob | What runs | Status |
+|---|---|---|---|
+| **fused** (default) | `TT_FUSED` unset or `1` | the whole device graph captured once into a metal trace and replayed per frame: 64-byte-page input upload + in-trace reshape, encoder + heads, `rms_norm` descriptor L2-norm, a standard-op device NMS (NMS-T: fold → two separable `[9,1]` max-pools → eq·mul), row-major outputs. No custom kernel. | device-validated on a p150a 2026-09-13 (`DEVICE_VALIDATION.md`) |
+| **legacy** | `TT_FUSED=0` | the untraced op-by-op forward (`run_untraced` / `run_device_compute`), TILE outputs, host fold + 9×9 NMS. Bit-for-bit the pre-2026-09-13 behaviour (same `CreateDevice` kwargs, same ops). `SP_TRACE_NMS=1` additionally closes the NMS loop on device through the custom `ttnn.experimental.sp_eq_mul_mask` kernel from `kernels/` (must be built into your tt-metal). | the port's original benchmark path; `run_benchmark.sh` and the `results.tsv` history |
+
+The knob is read **once** when `TtSuperPoint` is built (`fused=None` → env), never per call.
+Per-stage knobs (device A/B only — the default is all stages on):
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `TT_FUSED` | unset = fused | `0`/`false`/`no`/`off` → legacy path |
+| `TT_FUSED_STAGES` | `wide,nms,rms,rm` | comma list of fused stages; `""` = trace-only (legacy graph, traced). `wide` = 64-byte-page upload + in-trace reshape; `nms` = device NMS-T; `rms` = L2-norm as `ttnn.rms_norm`; `rm` = untilize the descriptor output on device |
+| `SP_TRACE_REGION` | 32 MiB | `trace_region_size` for `ttnn.CreateDevice` on the fused path |
+| `SP_N_ITER` | 10 (benchmark) / 20 (fused test) | timing iterations |
+| `SP_TRACE_NMS` | `0` | legacy path only: device NMS via the custom `sp_eq_mul_mask` kernel |
+| `SP_NO_TRACE` | `0` | legacy path only: `1` skips the traced-forward metrics |
+| `HF_MODEL` / `TT_WEIGHTS_REVISION` | `magic-leap-community/superpoint` @ main | weights pointer used by `models/reference` |
+| `TT_DEVICE_ID` / `DEVICE_ID` | `0` | chip id (`--device-id` on the pytest command line wins) |
+
+Exactness: trace, `wide`, `nms` and `rm` are bit-identical to the legacy path on the same bf16
+values (the device NMS map equals the host `fold_scores` + `simple_nms` with 0 mismatching
+pixels); `rms` is bf16-rounding-level (one final rounding instead of three — descriptor PCC
+0.999083 → 0.999085, max |1 − ‖d‖| 0.00488 → 0.00259).
+
 ## Running
 
 Prereqs:
-- A built `tt-metal` checkout (the `ttnn` runtime is loaded from there).
-- Python 3.12 venv with `torch`, `torchvision`, `transformers`, and
-  `loguru` installed.
-- One visible Blackhole chip.
+- A built `tt-metal` checkout (the `ttnn` runtime is loaded from there). Validated on
+  `v0.78.0-dev20260820`; the p150b numbers further down were taken on an older tree.
+- The checkout's `python_env` — it already has `torch`, `transformers`, `loguru` and
+  `pytest`; `run_benchmark.sh` uses it (override with `PYTHON=/path/to/python`).
+- One visible Blackhole chip (p150a/p150b).
+- Run pytest from the repo root: `pytest.ini` pins the rootdir here so `conftest.py`
+  (the `device` / `device_params` fixtures and `--device-id`) is always picked up.
+  tt-metal's own `conftest.py` cannot be loaded next to this repo — this regular `models`
+  package shadows tt-metal's namespace `models` package in any `sys.path` order.
 
 ```bash
-TT_METAL_DIR=/absolute/path/to/tt-metal \
-DEVICE_ID=0 \
-SP_N_ITER=100 \
-SP_TRACE_NMS=1 \
-bash run_benchmark.sh
+T=/absolute/path/to/tt-metal
+export PYTHONPATH=$PWD:$T TT_METAL_HOME=$T ARCH_NAME=blackhole
+
+# (a) host tests, torch only, no device (18 tests: NMS-T == fold + simple_nms bit for bit,
+#     wide-page view == same bytes, rms_norm L2 within 1 bf16 ULP, knob plumbing, conftest)
+$T/python_env/bin/python -m pytest -q models/tests/test_fused_host.py
+
+# (b) fused device test: eager == traced (torch.equal), device NMS map == host NMS,
+#     score PCC >= 0.997, descriptor PCC >= 0.999, keypoint F1 >= 0.9879, timings
+$T/python_env/bin/python -m pytest -s -q --device-id=0 \
+    models/tests/test_superpoint.py::test_superpoint_fused
+#     A/B one stage at a time, one fresh process per stage set (the eager pass fills the
+#     program cache the capture relies on):
+#     TT_FUSED_STAGES="" | "wide" | "wide,nms" | "wide,nms,rms" | "wide,nms,rms,rm"
+#     Prints fused_forward_ms, fused_h2d_plus_trace_ms, fused_postprocess_ms,
+#     fused_nms_map_mismatches (must be 0), score_pcc, descriptor_pcc, keypoint_f1@500_tol2.
+
+# (c) legacy benchmark = the knob-off regression gate (exports TT_FUSED=0 itself and the
+#     test pins fused=False); numbers are comparable with the rows in results.tsv
+TT_METAL_DIR=$T DEVICE_ID=0 SP_N_ITER=100 bash run_benchmark.sh          # -> run.log
+TT_METAL_DIR=$T DEVICE_ID=0 SP_N_ITER=100 SP_TRACE_NMS=1 bash run_benchmark.sh   # + custom-kernel device NMS
 ```
 
-`SP_TRACE_NMS=1` closes the NMS loop on device via the fused
-`ttnn.experimental.sp_eq_mul_mask` kernel — that's the fast e2e path
-(**40.7 fps** on a natural image vs 17 fps with host NMS).  Omit the flag
-to run the pure-forward trace with host NMS.
+`SP_TRACE_NMS=1` (legacy path) closes the NMS loop on device via the custom
+`ttnn.experimental.sp_eq_mul_mask` kernel — the port's original fast e2e path
+(**40.7 fps** on a natural image vs 17 fps with host NMS, p150b). Omit the flag
+to run the pure-forward trace with host NMS. The fused path reaches the same
+place with standard ttnn ops only (next section).
 
 ## Sample output
 
@@ -41,10 +93,76 @@ TT_METAL_DIR=/absolute/path/to/tt-metal \
 DEVICE_ID=0 \
 PYTHONPATH=.:$TT_METAL_DIR:$TT_METAL_DIR/ttnn \
 TT_METAL_HOME=$TT_METAL_DIR ARCH_NAME=blackhole \
-python models/visualize.py
+$TT_METAL_DIR/python_env/bin/python models/visualize.py
 ```
 
-## Final results (Blackhole p150b, 480×640, batch 1, natural image)
+## Fused path results (Blackhole p150a, tt-metal v0.78.0-dev20260820, measured 2026-09-13)
+
+All numbers below are measured (`DEVICE_VALIDATION.md` → *Results*); natural image
+`sample_data/house_in_field_1080p.jpg`, 480×640, batch 1.
+
+### Served, legacy → fused
+
+The port is also packaged as a tt-model container (`changh95/superpoint-p150` on the Hub;
+the FastAPI app itself is not part of this repo). Server `timing_ms`, 50 warm requests after
+10 warm-ups, 1600×900 JPEG in, median / min / max:
+
+| Path | JPEG decode + resize | device forward | host post-processing | total | client wall (median) |
+|---|---:|---:|---:|---:|---:|
+| legacy (`TT_FUSED=0`: untraced, host NMS; 30 requests) | 17.98 / 17.13 / 21.04 | 12.16 / 11.87 / 12.56 | 25.96 / 25.40 / 27.70 | 56.79 / 54.84 / 59.69 (~18 fps) | 61.6 ms |
+| **fused** (code default, no `TT_FUSED` in env) | 17.54 / 16.98 / 21.24 | **5.07 / 4.96 / 5.46** | **0.96 / 0.87 / 1.57** | **23.79 / 23.00 / 27.47 (~42 fps)** | 28.3 ms |
+
+fps in the table = 1000 / median total. The first served A/B on the same image (before the
+default flip, `TT_FUSED=1` set explicitly) measured 56.80 → 24.71 ms median total (2.3×;
+`device_forward` 12.37 → 5.28, `postprocess` 26.49 → 1.29). Both servers return the same
+539 keypoints; keypoints and scores are byte-identical, descriptors differ only through the
+`rms` stage (max |diff| 8.5e-4, worst cosine 0.999996). The remaining ~18 ms is host JPEG
+decode + resize, outside the device work. `TT_FUSED=0` on the final code is byte-identical to
+the pre-flip legacy server, descriptors included.
+
+### Standalone A/B (`test_superpoint_fused`, host `python_env`, `SP_N_ITER=50`)
+
+| Stage set (`TT_FUSED_STAGES`) | H2D + trace (ms) | forward incl. D2H + convert (ms) | host post (ms) | score PCC | descriptor PCC | F1@500/2 px | NMS-map mismatches |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `""` trace-only (legacy graph, traced) | 10.27 | 12.14 | 28.3 (host NMS) | 0.997109 | 0.999083 | 0.98796 | n/a |
+| `wide` | **3.47** | 5.02 | 28.5 | same | same | same | n/a |
+| `wide,nms` | 3.97 | 5.37 | **1.37** | same | same | same | **0** |
+| `wide,nms,rms` | 3.98 | 5.22 | 1.4 | same | **0.999085** | same | 0 |
+| `wide,nms,rms,rm` (all = default) | 3.99 | **4.89** | 1.74 | 0.997109 | 0.999085 | 0.98796 | 0 |
+
+Random input, all stages: 3.99 / 4.92 / 0.46 ms, PCC 0.996910 / 0.999056, F1 0.9768
+(stability check, not an accuracy claim). Eager == traced (`torch.equal`) for descriptors and
+the NMS map on every stage set. The `wide` stage alone removes 6.8 ms: the legacy
+`[1,1,307200,1]` upload was paying for 2-byte DRAM pages.
+
+Legacy regression on the same tree and chip (`run_benchmark.sh`, `SP_N_ITER=100`,
+`TT_FUSED=0`): `fps_compute_only` 355.38, traced-with-dual-CQ-H2D 97.24 fps, e2e 26.42 fps
+(host NMS 25.8 ms/iter); score PCC 0.997109, descriptor PCC 0.999083, recall/precision/F1
+0.9820/0.9940/0.98796 — unchanged vs the `da62f38` row of `results.tsv` (355.39 fps).
+
+### Accuracy (fp32 CPU torch reference, natural image)
+
+| Metric | legacy | fused (default) |
+|---|---:|---:|
+| Pre-NMS score map PCC | 0.997109 | 0.997109 |
+| Descriptor map PCC | 0.999083 | 0.999085 |
+| Keypoint set, top-500, 2 px: recall / precision / F1 | 98.20% / 99.40% / 98.80% | 98.20% / 99.40% / 98.80% |
+| max \|1 − ‖descriptor‖\| | 0.00488 | 0.00259 |
+
+Gates in `test_superpoint_fused`: score PCC ≥ 0.997, descriptor PCC ≥ 0.999, F1 ≥ 0.9879
+(the legacy path itself measures 0.98796, so a `≥ 0.988` gate written from the rounded
+"98.80%" fails on the legacy path — not a regression), NMS-map mismatches == 0, eager == traced.
+
+Not measured / not done: batch > 1 on the fused path (the server is batch 1); the occasional
+`device_forward` outlier (9.25 ms once in 50) was not profiled; the block-0/1 slice-in-L1 conv
+fusion (lever F in `DEVICE_VALIDATION.md`) was not attempted.
+
+## Standalone benchmark history (Blackhole p150b, 480×640, batch 1, natural image)
+
+The port's original numbers from `run_benchmark.sh` on a p150b with an older tt-metal, i.e.
+the **legacy** path (`TT_FUSED=0`) with and without the custom-kernel device NMS
+(`SP_TRACE_NMS`). Kept as the optimisation history; the 2026-09-13 p150a regression run above
+reproduces the compute-only fps and PCC rows.
 
 ### PCC vs Hugging Face reference (fp32 CPU torch)
 
@@ -62,9 +180,12 @@ matching radius = 2 pixels:
 
 | Metric | tt-nn vs torch reference |
 |---|---:|
-| Recall | **98.80%** |
-| Precision | **98.80%** |
-| **F1** | **98.80%** |
+| Recall | **98.20%** |
+| Precision | **99.40%** |
+| **F1** | **98.80%** (0.98796) |
+
+(Measured 2026-09-13 on the p150a, identical on the legacy and fused paths; the original
+p150b run reported recall = precision = F1 = 98.80%.)
 
 For the synthetic `torch.rand` input (distribution the model was not
 trained on), F1 is 97.80% — included as a stability check, not an
@@ -269,14 +390,17 @@ here are short hashes from the branch the work was developed on.
 ```
 tt-superpoint/
 ├── README.md
-├── run_benchmark.sh              # Driver; requires TT_METAL_DIR
-├── results.tsv                   # Full experiment log
+├── DEVICE_VALIDATION.md          # Fused-path plan, gates, knobs and the 2026-09-13 measured results
+├── run_benchmark.sh              # Legacy-path benchmark driver (TT_FUSED=0); requires TT_METAL_DIR
+├── conftest.py                   # device / device_params fixtures, --device-id (repo-local)
+├── pytest.ini                    # pins the pytest rootdir here; testpaths = models/tests
+├── results.tsv                   # Full experiment log (incl. the 2026-09-13 fused A/B rows)
 ├── sample_data/
 │   └── house_in_field_1080p.jpg  # Natural-image validation input
 ├── media/
 │   └── sample.png                # Rendered keypoint visualisation
 ├── kernels/
-│   └── sp_eq_mul_mask/              # Fused C++ Tensix kernel (eq + mul in one pass)
+│   └── sp_eq_mul_mask/              # Custom C++ Tensix kernel (eq + mul in one pass), legacy SP_TRACE_NMS path
 │       ├── README.md                # Install + measurements
 │       ├── test.py                  # Correctness vs torch reference
 │       ├── bench.py                 # Fused vs composed throughput
@@ -285,10 +409,12 @@ tt-superpoint/
 └── models/
     ├── visualize.py                 # Keypoint visualisation script
     ├── reference/
-    │   └── superpoint_reference.py  # HF reference model loader + input helpers
+    │   └── superpoint_reference.py  # HF reference model loader + input helpers (HF_MODEL / TT_WEIGHTS_REVISION)
     ├── tests/
-    │   └── test_superpoint.py       # Benchmark + PCC + keypoint-set test
+    │   ├── test_superpoint.py       # Device tests: legacy benchmark + PCC + keypoint set; test_superpoint_fused
+    │   └── test_fused_host.py       # Torch-only host tests for the fused reformulations and the knob
     └── tt/
-        └── superpoint_ttnn.py       # tt-nn implementation
+        ├── superpoint_ttnn.py       # tt-nn implementation: legacy path + fused graph / trace
+        ├── fused_host.py            # TT_FUSED knob plumbing + torch emulation of the device op sequence
+        └── postprocess.py           # Host post-processing (fold, NMS, threshold, top-k, grid_sample)
 ```
-

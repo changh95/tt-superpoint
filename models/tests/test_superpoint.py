@@ -3,8 +3,14 @@
 
 """SuperPoint benchmark + accuracy test.
 
-Run with:
-    pytest -s -q models/experimental/superpoint/tests/test_superpoint.py::test_superpoint_benchmark
+Run from ``code/`` with the tt-metal tree's python_env (the ``device`` / ``device_params``
+fixtures and ``--device-id`` come from ``code/conftest.py``; tt-metal's own conftest cannot be
+loaded next to this repo because ``code/models`` shadows its namespace ``models`` package):
+
+    <tree>/python_env/bin/python -m pytest -s -q --device-id=0 \
+        models/tests/test_superpoint.py::test_superpoint_benchmark      # legacy path (fused=False; run_benchmark.sh)
+    <tree>/python_env/bin/python -m pytest -s -q --device-id=0 \
+        models/tests/test_superpoint.py::test_superpoint_fused          # fused path (default) A/B via TT_FUSED_STAGES
 
 Prints:
     inference_speed=<fps>
@@ -128,7 +134,9 @@ def test_superpoint_benchmark(device, height, width, input_kind):
     with torch.no_grad():
         _ = torch_model(pixel_values=pixel_values)  # keep weights loaded on CPU
 
-    tt_model = TtSuperPoint(torch_model, device, input_height=height, input_width=width)
+    # This is the LEGACY benchmark (run_benchmark.sh, results.tsv history): pin the knob off
+    # explicitly -- TT_FUSED defaults to the fused path since 2026-09-13.
+    tt_model = TtSuperPoint(torch_model, device, input_height=height, input_width=width, fused=False)
     b = 1
 
     # Persistent device input tensor (filled via copy_host_to_device_tensor).
@@ -352,3 +360,154 @@ def test_superpoint_benchmark(device, height, width, input_kind):
 
     if tid is not None:
         ttnn.release_trace(device, tid)
+
+
+
+# --------------------------------------------------------------------------- TT_FUSED path
+# Device test for the hardware pass of the opt/superpoint-p150-megakernel branch (never run on
+# the host; see DEVICE_VALIDATION.md). Same accuracy gates as the benchmark above, plus the
+# bit-identity gates the fused reformulations promise:
+#   * eager fused graph == traced replay (descriptors and NMS map, torch.equal)
+#   * device NMS-T map == host fold_scores(s_sm, r) + simple_nms on the SAME traced s_sm (torch.equal)
+#   * score PCC >= 0.997, descriptor PCC >= 0.999, keypoint F1 >= 0.9879 @ top-500 / 2 px (natural image;
+#     the legacy path measures F1 0.98796 = recall 0.9820 / precision 0.9940, "98.80%" on the card)
+# A/B a single stage with TT_FUSED_STAGES (e.g. "" = trace-only, "wide", "wide,nms", ...).
+
+FUSED_TRACE_REGION_SIZE = 32 * 1024 * 1024
+
+
+@pytest.mark.parametrize("height,width", [(480, 640)])
+@pytest.mark.parametrize("input_kind", ["natural", "random"])
+@pytest.mark.parametrize(
+    "device_params",
+    [{"l1_small_size": 32 * 1024, "trace_region_size": FUSED_TRACE_REGION_SIZE, "num_command_queues": 1}],
+    indirect=True,
+)
+def test_superpoint_fused(device, height, width, input_kind):
+    from models.tt import postprocess as _post
+
+    torch.manual_seed(0)
+    torch_model = load_reference_model()
+    if input_kind == "natural":
+        pixel_values = get_natural_input(batch_size=1, height=height, width=width)
+    else:
+        pixel_values = get_dummy_input(batch_size=1, height=height, width=width)
+
+    stages = os.environ.get("TT_FUSED_STAGES")  # None -> all stages
+    tt_model = TtSuperPoint(torch_model, device, input_height=height, input_width=width, fused=True)
+    logger.info(f"TT_FUSED stages: {sorted(tt_model.fused_stages)} (TT_FUSED_STAGES={stages!r})")
+    tt_in = tt_model.allocate_input(batch_size=1)
+
+    # 1) eager compile pass (JIT + conv weight preparation), 2) capture, 3) traced replay.
+    t0 = time.perf_counter()
+    eager = tt_model.run_fused(tt_in, pixel_values)
+    ttnn.synchronize_device(device)
+    t_compile = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    tt_model.capture_trace(tt_in, b=1)
+    t_capture = time.perf_counter() - t0
+    traced = tt_model.run_fused(tt_in, pixel_values)
+    ttnn.synchronize_device(device)
+    logger.info(f"compile {t_compile:.2f}s, capture {t_capture*1e3:.1f} ms, trace_id={tt_model.trace_id}")
+    assert tt_model.trace_id is not None
+
+    # Same graph, same input -> eager and traced outputs must be identical.
+    assert torch.equal(eager.descriptors_nchw, traced.descriptors_nchw), "eager vs traced descriptors differ"
+    if traced.nms_map is not None:
+        assert eager.nms_map is not None and torch.equal(eager.nms_map, traced.nms_map), "eager vs traced NMS map differ"
+
+    # Scores via the fallback readback (any radius != traced -> scores_nchw from the traced s_sm).
+    fallback = tt_model.run_fused(tt_in, pixel_values, nms_radius=tt_model.nms_radius_traced + 1)
+    assert fallback.scores_nchw is not None and fallback.nms_map is None
+    tt_scores_nchw, tt_desc_nchw = fallback.scores_nchw, fallback.descriptors_nchw
+    tt_scores_pre_nms = _post.fold_scores(tt_scores_nchw, None)
+
+    # Device NMS-T must be bit-identical to the host fold + simple_nms of the SAME s_sm.
+    if traced.nms_map is not None:
+        host_nms = _post.fold_scores(tt_scores_nchw, tt_model.nms_radius_traced)
+        n_diff = int((traced.nms_map != host_nms).sum())
+        print(f"fused_nms_map_mismatches={n_diff}")
+        assert n_diff == 0, f"device NMS-T map differs from host simple_nms in {n_diff} pixels"
+        tt_scores_nms = traced.nms_map[0]
+    else:
+        tt_scores_nms = _post.fold_scores(tt_scores_nchw, tt_model.nms_radius)[0]
+
+    # Replay determinism over a few iterations + timing (H2D + execute_trace + D2H + host convert).
+    n_iter = int(os.environ.get("SP_N_ITER", "20"))
+    host_input = tt_model.prepare_host_input(pixel_values)
+    t0 = time.perf_counter()
+    for _ in range(n_iter):
+        tt_model.load_input_prepared(tt_in, host_input)
+        ttnn.execute_trace(device, tt_model.trace_id, cq_id=0, blocking=False)
+    ttnn.synchronize_device(device)
+    compute_ms = (time.perf_counter() - t0) / n_iter * 1e3  # H2D + trace, no D2H
+    t0 = time.perf_counter()
+    for _ in range(n_iter):
+        again = tt_model.run_fused(tt_in, pixel_values)
+    forward_ms = (time.perf_counter() - t0) / n_iter * 1e3
+    assert torch.equal(again.descriptors_nchw, traced.descriptors_nchw)
+    if traced.nms_map is not None:
+        assert torch.equal(again.nms_map, traced.nms_map)
+
+    # Host post-processing time on the fused result (what the server does after device_forward).
+    t0 = time.perf_counter()
+    if traced.nms_map is not None:
+        kp, sc, desc = _post.postprocess_from_nms_map(
+            traced.nms_map, traced.descriptors_nchw, keypoint_threshold=0.005, max_keypoints=1024,
+            border_removal_distance=4, with_descriptors=True,
+        )[0]
+    else:
+        kp, sc, desc = _post.postprocess_keypoints(
+            tt_scores_nchw, tt_desc_nchw, nms_radius=tt_model.nms_radius, keypoint_threshold=0.005,
+            max_keypoints=1024, border_removal_distance=4, with_descriptors=True,
+        )[0]
+    post_ms = (time.perf_counter() - t0) * 1e3
+
+    # Reference (identical to test_superpoint_benchmark).
+    with torch.no_grad():
+        enc = torch_model.encoder(torch_model.extract_one_channel_pixel_values(pixel_values))[0]
+        ks = torch_model.keypoint_decoder.relu(torch_model.keypoint_decoder.conv_score_a(enc))
+        ks = torch_model.keypoint_decoder.conv_score_b(ks)
+        ks = F.softmax(ks, 1)[:, :-1]
+        _, _, h_, w_ = ks.shape
+        ks = ks.permute(0, 2, 3, 1).reshape(1, h_, w_, 8, 8)
+        ref_score_pre = ks.permute(0, 1, 3, 2, 4).reshape(1, h_ * 8, w_ * 8)
+        ref_desc_full = F.normalize(
+            torch_model.descriptor_decoder.conv_descriptor_b(
+                torch_model.descriptor_decoder.relu(torch_model.descriptor_decoder.conv_descriptor_a(enc))
+            ),
+            p=2,
+            dim=1,
+        )
+        ref_scores_nms = _post.simple_nms(ref_score_pre, tt_model.nms_radius)[0]
+
+    score_pcc = _pcc(tt_scores_pre_nms, ref_score_pre)
+    desc_pcc = _pcc(tt_desc_nchw, ref_desc_full)
+    recall_500, precision_500, f1_500 = _keypoint_set_metrics(tt_scores_nms, ref_scores_nms, k=500, tol=2)
+    desc_norm_dev = float((tt_desc_nchw.norm(dim=1) - 1.0).abs().max())
+
+    print(f"input_kind={input_kind}")
+    print(f"fused_stages={','.join(sorted(tt_model.fused_stages)) or 'trace-only'}")
+    print(f"fused_compile_s={t_compile:.3f}")
+    print(f"fused_trace_capture_ms={t_capture*1e3:.2f}")
+    print(f"fused_h2d_plus_trace_ms={compute_ms:.3f}")
+    print(f"fused_forward_ms={forward_ms:.3f}")
+    print(f"fused_postprocess_ms={post_ms:.3f}")
+    print(f"fused_num_keypoints={int(kp.shape[0])}")
+    print(f"score_pcc={score_pcc:.6f}")
+    print(f"descriptor_pcc={desc_pcc:.6f}")
+    print(f"descriptor_norm_max_dev={desc_norm_dev:.5f}")
+    print(f"keypoint_recall@500_tol2={recall_500:.4f}")
+    print(f"keypoint_precision@500_tol2={precision_500:.4f}")
+    print(f"keypoint_f1@500_tol2={f1_500:.4f}")
+
+    assert torch.isfinite(tt_scores_pre_nms).all() and torch.isfinite(tt_desc_nchw).all()
+    if input_kind == "natural":
+        assert score_pcc >= 0.997, score_pcc
+        assert desc_pcc >= 0.999, desc_pcc
+        # Legacy path on this frame (run_benchmark.sh, 2026-09-13 p150a): recall 0.9820, precision
+        # 0.9940 -> F1 0.98796; the card's "98.80%" is that value rounded. Gate on the measured
+        # legacy value, not on the rounded card number (0.988 would fail the legacy path too).
+        assert f1_500 >= 0.9879, f1_500
+    tt_model.release()
+    ttnn.deallocate(tt_in)

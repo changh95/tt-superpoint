@@ -1,6 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from __future__ import annotations
+
+import os
 from pathlib import Path
 
 import torch
@@ -14,14 +17,23 @@ MODEL_ID = "magic-leap-community/superpoint"
 DEFAULT_NATURAL_IMAGE = Path(__file__).resolve().parents[2] / "sample_data" / "house_in_field_1080p.jpg"
 
 
-def load_reference_model():
-    model = SuperPointForKeypointDetection.from_pretrained(MODEL_ID)
+def _weights_pointer(model_id, revision):
+    """Repo id + revision: explicit args, else HF_MODEL / TT_WEIGHTS_REVISION, else MODEL_ID@main."""
+    model_id = model_id or os.environ.get("HF_MODEL") or MODEL_ID
+    revision = revision or os.environ.get("TT_WEIGHTS_REVISION") or None
+    return model_id, revision
+
+
+def load_reference_model(model_id: str | None = None, revision: str | None = None):
+    model_id, revision = _weights_pointer(model_id, revision)
+    model = SuperPointForKeypointDetection.from_pretrained(model_id, revision=revision)
     model.eval()
     return model
 
 
-def load_image_processor():
-    return AutoImageProcessor.from_pretrained(MODEL_ID)
+def load_image_processor(model_id: str | None = None, revision: str | None = None):
+    model_id, revision = _weights_pointer(model_id, revision)
+    return AutoImageProcessor.from_pretrained(model_id, revision=revision)
 
 
 def get_dummy_input(batch_size: int = 1, height: int = 480, width: int = 640):

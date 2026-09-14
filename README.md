@@ -418,3 +418,19 @@ tt-superpoint/
         ├── fused_host.py            # TT_FUSED knob plumbing + torch emulation of the device op sequence
         └── postprocess.py           # Host post-processing (fold, NMS, threshold, top-k, grid_sample)
 ```
+
+## Comparison with an RTX 5090 (same host, 2026-09-14)
+
+device forward incl. NMS, 480×640, batch 1; ratio = p150a ms / GPU ms.
+
+| setting | ms | vs p150a |
+|---|---:|---|
+| p150a, bf16 fused trace + device NMS (served `timing_ms.device_forward`) | 5.1 | — |
+| RTX 5090 fp32 strict | 2.9 | GPU 1.7× |
+| RTX 5090 bf16 autocast | 1.6 | GPU 3.2× |
+| RTX 5090 fp16 autocast | 1.5 | GPU 3.4× |
+| RTX 5090 fp16 + `torch.compile` | 1.2 | GPU 4.2× |
+
+End-to-end both sides are bound by the ~18 ms JPEG decode/resize on the host (GPU served-like 21.5 ms vs p150a 23.9 ms, 1.1×).
+
+Methodology: same host, this repo's torch reference (same weights and preprocessing as the served p150a path) run eagerly in PyTorch 2.11 cu128 (fp32 weights + `torch.autocast` unless stated; no TensorRT), batch 1, medians of 50 iterations after warm-up, H2D/D2H included; GPU fp32 output matches the CPU fp32 reference (PCC 1.0). p150a rows are the served bf16 fused path incl. upload/readback. p150a power was not measured, so no efficiency comparison is made. Full per-precision table, power and memory: [`GPU_COMPARISON.md`](GPU_COMPARISON.md).
